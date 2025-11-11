@@ -70,10 +70,6 @@ src/
 - **Styling**: Tailwind CSS
 - **Data**: Synthetic patient data generator
 
-## Success Metric (MVP Pilot)
-
-Concierge physicians in the pilot must confirm that the time required for pre-visit data synthesis is reduced by at least 50%.
-
 ## Learn More
 
 See `DATA_SUMMARY.md` for details on the synthetic patient dataset.
