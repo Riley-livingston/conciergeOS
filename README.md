@@ -24,7 +24,6 @@ Precision Clinical OS is the first platform engineered to solve the physician's 
 
 4. **Role-Based Access**
    - Physician view: Full access to all data
-   - Coach view: Limited data review (no EHR/genetic access)
 
 ## Getting Started
 
