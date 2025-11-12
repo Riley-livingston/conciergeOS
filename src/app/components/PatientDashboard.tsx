@@ -11,6 +11,8 @@ import {
   Tooltip,
   Legend,
   ReferenceLine,
+  Line,
+  LineChart,
 } from "recharts";
 import {
   SerializedPatient,
@@ -19,8 +21,11 @@ import {
   SerializedWearableData,
   SerializedEHREvent,
   GeneticMarker,
+  TrendAlert,
+  HealthPillar,
 } from "@/lib/types/patient";
 import { formatDate, formatRelative } from "@/lib/utils/format";
+import { detectTrends } from "@/lib/utils/trendDetection";
 
 const CATEGORY_CONFIG = {
   clinicalLabs: {
@@ -200,6 +205,7 @@ function renderLegendShape(shapeType: ShapeType, color: string, size: number = 6
 type CategoryKey = keyof typeof CATEGORY_CONFIG;
 
 const TIME_RANGES = [
+  { label: "1M", months: 1 },
   { label: "3M", months: 3 },
   { label: "6M", months: 6 },
   { label: "1Y", months: 12 },
@@ -379,6 +385,24 @@ export const PatientDashboard = ({ patient, timeline }: PatientDashboardProps) =
     return points;
   }, [timeline]);
 
+  // Detect trends and generate alerts
+  // Use filteredPoints to respect time range, but need enough data points
+  // For proactive alerts, we want to see trends, so use all normalized points
+  const trendAlerts = useMemo(() => {
+    const alerts = detectTrends(normalizedPoints);
+    // Debug: log alerts to console
+    console.log('Trend alerts calculated:', alerts.length, 'alerts');
+    if (alerts.length > 0) {
+      console.log('Proactive alerts detected:', alerts.map(a => ({ 
+        metric: a.metricLabel, 
+        severity: a.severity, 
+        value: a.currentValue,
+        pillar: a.healthPillar 
+      })));
+    }
+    return alerts;
+  }, [normalizedPoints]);
+
   // Get all available wearable types from the data
   const availableWearableTypes = useMemo(() => {
     const types = new Set<string>();
@@ -472,8 +496,12 @@ export const PatientDashboard = ({ patient, timeline }: PatientDashboardProps) =
 
   // Group points by metric label instead of category
   // Clinical labs all use the same color and shape
+  // Add alert indicators for points with active alerts
   const pointsByMetric = useMemo(() => {
-    const grouped: Record<string, Array<NormalizedPoint & { x: number; y: number; color: string; shape: ShapeType }>> = {};
+    const grouped: Record<string, Array<NormalizedPoint & { x: number; y: number; color: string; shape: ShapeType; hasAlert?: boolean }>> = {};
+    
+    // Create a set of metrics that have alerts for quick lookup
+    const metricsWithAlerts = new Set(trendAlerts.map(a => a.metricLabel));
     
     filteredPoints.forEach((point) => {
       // Clinical labs all use the same color and shape
@@ -484,12 +512,20 @@ export const PatientDashboard = ({ patient, timeline }: PatientDashboardProps) =
         ? "circle" as ShapeType
         : getMetricShape(point.label);
       
+      const hasAlert = metricsWithAlerts.has(point.label);
+      
+      // Add jitter to prevent overlapping points
+      // Jitter is proportional to the data range
+      const xJitter = (Math.random() - 0.5) * (24 * 60 * 60 * 1000); // ±12 hours
+      const yJitter = (Math.random() - 0.5) * 2; // ±1% on Y axis
+      
       const transformedPoint = {
         ...point,
-        x: new Date(point.timestamp).getTime(),
-        y: point.normalizedValue,
+        x: new Date(point.timestamp).getTime() + xJitter,
+        y: point.normalizedValue + yJitter,
         color,
         shape,
+        hasAlert,
       };
       
       if (!grouped[point.label]) {
@@ -499,7 +535,78 @@ export const PatientDashboard = ({ patient, timeline }: PatientDashboardProps) =
     });
     
     return grouped;
-  }, [filteredPoints]);
+  }, [filteredPoints, trendAlerts]);
+
+  // Calculate trend lines for metrics with alerts
+  const trendLines = useMemo(() => {
+    const lines: Array<{
+      metricLabel: string;
+      color: string;
+      points: Array<{ x: number; y: number }>;
+    }> = [];
+
+    trendAlerts.forEach(alert => {
+      // Get the data points for this metric
+      const metricData = pointsByMetric[alert.metricLabel];
+      if (!metricData || metricData.length < 2) return;
+
+      // Use the alert's data points to calculate trend line
+      if (alert.dataPoints.length < 2) return;
+
+      // Get the time range from filtered points
+      const filteredDataForMetric = filteredPoints.filter(p => p.label === alert.metricLabel);
+      if (filteredDataForMetric.length < 2) return;
+
+      const minX = Math.min(...filteredDataForMetric.map(p => new Date(p.timestamp).getTime()));
+      const maxX = Math.max(...filteredDataForMetric.map(p => new Date(p.timestamp).getTime()));
+
+      // Calculate trend from alert data points (these are the recent points used for detection)
+      const alertDataPoints = alert.dataPoints
+        .map(dp => {
+          const point = filteredDataForMetric.find(p => 
+            Math.abs(new Date(p.timestamp).getTime() - new Date(dp.timestamp).getTime()) < 24 * 60 * 60 * 1000
+          );
+          return point ? {
+            x: new Date(point.timestamp).getTime(),
+            y: point.normalizedValue,
+            actualValue: point.actualValue
+          } : null;
+        })
+        .filter((p): p is { x: number; y: number; actualValue: number } => p !== null);
+
+      if (alertDataPoints.length < 2) return;
+
+      // Calculate linear regression for the trend line
+      const n = alertDataPoints.length;
+      const sumX = alertDataPoints.reduce((sum, p) => sum + p.x, 0);
+      const sumY = alertDataPoints.reduce((sum, p) => sum + p.y, 0);
+      const sumXY = alertDataPoints.reduce((sum, p) => sum + p.x * p.y, 0);
+      const sumX2 = alertDataPoints.reduce((sum, p) => sum + p.x * p.x, 0);
+
+      const slope = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
+      const intercept = (sumY - slope * sumX) / n;
+
+      // Generate trend line points across the visible X range
+      const linePoints: Array<{ x: number; y: number }> = [];
+      const numPoints = 50; // Smooth line
+      for (let i = 0; i <= numPoints; i++) {
+        const x = minX + ((maxX - minX) * i) / numPoints;
+        const y = slope * x + intercept;
+        // Clamp Y to 0-100 range
+        linePoints.push({ x, y: Math.max(0, Math.min(100, y)) });
+      }
+
+      // Get the color for this metric
+      const firstPoint = metricData[0];
+      lines.push({
+        metricLabel: alert.metricLabel,
+        color: firstPoint.color,
+        points: linePoints,
+      });
+    });
+
+    return lines;
+  }, [trendAlerts, pointsByMetric, filteredPoints]);
 
   const statSummary = useMemo(() => {
     const clinicalLabs = patient.labs.length;
@@ -623,8 +730,8 @@ export const PatientDashboard = ({ patient, timeline }: PatientDashboardProps) =
                   <h1 className="text-xl font-semibold text-slate-900">{patient.name}</h1>
                   <p className="text-sm text-slate-500">
                     ID: {patient.id ?? "PT-001"} • Age: {age} • DOB {formatDate(patient.dateOfBirth)}
-                  </p>
-                </div>
+                </p>
+              </div>
               </div>
             </div>
             <div className="rounded-2xl bg-slate-50 px-4 py-2 text-right text-sm text-slate-500">
@@ -652,7 +759,7 @@ export const PatientDashboard = ({ patient, timeline }: PatientDashboardProps) =
               </p>
             </div>
             <div className="flex flex-wrap items-center gap-3 text-sm text-slate-500">
-              <button
+                  <button
                 onClick={() => setShowSignalsOnly((prev) => !prev)}
                 className={`flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm font-medium transition ${
                   showSignalsOnly
@@ -714,7 +821,8 @@ export const PatientDashboard = ({ patient, timeline }: PatientDashboardProps) =
             {(activeCategories.includes("wearables") || activeCategories.includes("vitals")) && availableWearableTypes.length > 0 && (
               <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
                 <div className="mb-3 flex items-center justify-between">
-                  <p className="text-xs font-semibold uppercase tracking-[0.3em] text-slate-500">
+                  <p className="text-xs font-semibold uppercase tracking-[0.3em] text-slate-500 flex items-center gap-1.5">
+                    <span className="text-red-500">⚠</span>
                     Filter by Metric
                   </p>
                   <button
@@ -866,8 +974,8 @@ export const PatientDashboard = ({ patient, timeline }: PatientDashboardProps) =
                             <p className="text-slate-500">
                               Reference Range: {data.referenceRange.min.toFixed(1)} - {data.referenceRange.max.toFixed(1)} {data.unit}
                             </p>
-                          </div>
-                        </div>
+            </div>
+                </div>
                       );
                     }
                     
@@ -902,7 +1010,7 @@ export const PatientDashboard = ({ patient, timeline }: PatientDashboardProps) =
                           <p>
                             Reference Range: <span className="font-semibold text-slate-800">
                               {point.referenceRange.min.toFixed(1)} - {point.referenceRange.max.toFixed(1)} {point.unit}
-                            </span>
+                        </span>
                           </p>
                           {point.source ? <p>Source: {point.source}</p> : null}
                           {point.isOutOfRange && outOfRangeBy !== null ? (
@@ -910,15 +1018,15 @@ export const PatientDashboard = ({ patient, timeline }: PatientDashboardProps) =
                               <span className="font-semibold">Out of Range by {outOfRangeBy.toFixed(1)}%</span>
                               <span className="ml-1 text-slate-500">
                                 ({outOfRangeDirection === "above" ? "above" : "below"} reference range)
-              </span>
+                        </span>
                             </p>
                           ) : (
                             <p className={`mt-2 inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-widest bg-emerald-50 text-emerald-600`}>
                               In Range
                             </p>
                           )}
-                        </div>
                       </div>
+                    </div>
                     );
                   }}
                 />
@@ -930,6 +1038,8 @@ export const PatientDashboard = ({ patient, timeline }: PatientDashboardProps) =
                 {Object.entries(pointsByMetric).map(([metricLabel, data]) => {
                   if (data.length === 0) return null;
                   const firstPoint = data[0];
+                  const hasAlert = firstPoint.hasAlert || false;
+                  
                   return (
                     <Scatter
                       key={metricLabel}
@@ -938,14 +1048,67 @@ export const PatientDashboard = ({ patient, timeline }: PatientDashboardProps) =
                       fill={firstPoint.color}
                       shape={(props: any) => {
                         const { cx, cy } = props;
-                        return renderShape(firstPoint.shape, cx, cy, firstPoint.color, 4);
+                        const shapeElement = renderShape(firstPoint.shape, cx, cy, firstPoint.color, 4);
+                        
+                        // Add alert indicator (dashed ring) if this metric has an alert
+                        if (hasAlert) {
+                          return (
+                            <g>
+                              {shapeElement}
+                              <circle
+                                cx={cx}
+                                cy={cy}
+                                r={6}
+                                fill="none"
+                                stroke="#EF4444"
+                                strokeWidth={2}
+                                strokeDasharray="3 3"
+                                opacity={0.6}
+                              />
+                            </g>
+                          );
+                        }
+                        return shapeElement;
                       }}
+                    />
+                  );
+                })}
+                {/* Trend lines for metrics with alerts - using ReferenceLine segments */}
+                {trendLines.map((line, idx) => {
+                  if (line.points.length < 2) return null;
+                  // Use the first and last points to draw a simple trend line
+                  const firstPoint = line.points[0];
+                  const lastPoint = line.points[line.points.length - 1];
+                  
+                  // Calculate slope and intercept for the line equation: y = mx + b
+                  const slope = (lastPoint.y - firstPoint.y) / (lastPoint.x - firstPoint.x);
+                  const intercept = firstPoint.y - slope * firstPoint.x;
+                  
+                  // Create two points at the edges of the visible range for the line
+                  const minX = Math.min(...filteredPoints.map(p => new Date(p.timestamp).getTime()));
+                  const maxX = Math.max(...filteredPoints.map(p => new Date(p.timestamp).getTime()));
+                  
+                  const y1 = Math.max(0, Math.min(100, slope * minX + intercept));
+                  const y2 = Math.max(0, Math.min(100, slope * maxX + intercept));
+                  
+                  // Draw the line using a custom shape
+                  return (
+                    <ReferenceLine
+                      key={`trend-${line.metricLabel}-${idx}`}
+                      segment={[
+                        { x: minX, y: y1 },
+                        { x: maxX, y: y2 }
+                      ]}
+                      stroke={line.color}
+                      strokeWidth={2}
+                      strokeDasharray="5 5"
+                      opacity={0.7}
                     />
                   );
                 })}
               </ScatterChart>
             </ResponsiveContainer>
-            </div>
+                    </div>
             
             {/* Custom Legend with matching shapes - exclude clinical labs */}
             {Object.keys(pointsByMetric).length > 0 && (
@@ -970,10 +1133,10 @@ export const PatientDashboard = ({ patient, timeline }: PatientDashboardProps) =
                             {renderLegendShape(firstPoint.shape, firstPoint.color, 6)}
                           </svg>
                           <span className="text-xs font-medium text-slate-700">{metricLabel}</span>
-                        </div>
+                  </div>
                       );
                     })}
-                </div>
+            </div>
                 
                 {/* Average values legend - only show when clinical labs is deselected */}
                 {wearableAverageLines.length > 0 && !activeCategories.includes("clinicalLabs") && (
@@ -999,13 +1162,61 @@ export const PatientDashboard = ({ patient, timeline }: PatientDashboardProps) =
                             <p className="mt-0.5 text-[10px] text-slate-500">
                               {avg.averageNormalized.toFixed(1)}% of range
                             </p>
-                      </div>
+            </div>
                     </div>
                       ))}
                     </div>
                   </div>
-              )}
+          )}
+
+                {/* Warnings Section - Show alerts for metrics in the current view */}
+                {trendAlerts.length > 0 && (
+                  <div className="mt-4 border-t border-slate-200 pt-4">
+                    <p className="mb-3 text-xs font-semibold uppercase tracking-[0.3em] text-slate-500 flex items-center gap-1.5">
+                      <span className="text-red-500">⚠</span>
+                      Proactive Health Alerts
+                    </p>
+                    <div className="space-y-2">
+                      {trendAlerts
+                        .filter(alert => {
+                          // Only show alerts for metrics that are currently visible
+                          return Object.keys(pointsByMetric).includes(alert.metricLabel);
+                        })
+                        .map(alert => {
+                          const severityColors = alert.severity === 'warning'
+                            ? { bg: 'bg-red-50', border: 'border-red-200', text: 'text-red-800', badge: 'bg-red-100 text-red-800' }
+                            : { bg: 'bg-amber-50', border: 'border-amber-200', text: 'text-amber-800', badge: 'bg-amber-100 text-amber-800' };
+                          
+                          // Check if the value is still within range (hasn't breached yet)
+                          const isWithinRange = alert.currentValue >= alert.referenceRange.min && 
+                                                alert.currentValue <= alert.referenceRange.max;
+                          
+                          return (
+                            <div key={alert.id} className={`rounded-lg border ${severityColors.border} ${severityColors.bg} p-2.5`}>
+                              <div className="flex items-center justify-between">
+                                <div className="flex items-center gap-2">
+                                  <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-semibold ${severityColors.badge}`}>
+                                    {alert.severity === 'warning' ? '⚠ Warning' : '⚠ Caution'}
+                                  </span>
+                                  <span className="text-xs font-semibold text-slate-900">{alert.metricLabel}</span>
             </div>
+                                <span className="text-xs text-slate-600">
+                                  {alert.currentValue.toFixed(1)} {alert.unit}
+                                </span>
+                              </div>
+                              <p className="mt-1 text-xs text-slate-700">{alert.message}</p>
+                              {isWithinRange && alert.daysToEdge !== undefined && (
+                                <p className="mt-1.5 text-xs font-semibold text-slate-800">
+                                  Estimated <span className="text-red-600">{alert.daysToEdge} days</span> until {alert.alertType.includes('lower') ? 'lower' : 'upper'} limit breach if trend continues
+                                </p>
+                              )}
+                            </div>
+                          );
+                        })}
+                    </div>
+                  </div>
+                )}
+              </div>
             )}
         </section>
 
@@ -1013,7 +1224,7 @@ export const PatientDashboard = ({ patient, timeline }: PatientDashboardProps) =
           <div className="flex items-center justify-between">
             <h3 className="text-lg font-semibold text-slate-900">Current Medications</h3>
             <p className="text-xs uppercase tracking-[0.3em] text-slate-400">Active Prescriptions</p>
-          </div>
+  </div>
           {currentMedications.length === 0 ? (
             <div className="mt-4 rounded-2xl border border-dashed border-slate-300 bg-slate-50 p-8 text-center">
               <p className="text-sm text-slate-500">No active medications recorded</p>
@@ -1036,11 +1247,140 @@ export const PatientDashboard = ({ patient, timeline }: PatientDashboardProps) =
             {patient.geneticMarkers.map((marker) => (
               <GeneticMarkerCard key={marker.id} marker={marker} />
             ))}
-          </div>
+        </div>
         </section>
       </div>
     </div>
   );
+};
+
+// Trend Alerts Component - Five Pillars of Health
+const TrendAlerts = ({ alerts }: { alerts: TrendAlert[] }) => {
+  if (alerts.length === 0) {
+    return (
+      <section className="rounded-3xl bg-white p-6 shadow-sm ring-1 ring-slate-200">
+        <div className="text-center py-4">
+          <p className="text-sm text-slate-500">No proactive alerts at this time</p>
+          <p className="text-xs text-slate-400 mt-1">All metrics are within safe ranges</p>
+  </div>
+      </section>
+    );
+  }
+  
+  const warningAlerts = alerts.filter(a => a.severity === 'warning');
+  const cautionAlerts = alerts.filter(a => a.severity === 'caution');
+  
+  // Group by health pillar
+  const alertsByPillar = alerts.reduce((acc, alert) => {
+    if (!acc[alert.healthPillar]) {
+      acc[alert.healthPillar] = [];
+    }
+    acc[alert.healthPillar].push(alert);
+    return acc;
+  }, {} as Record<HealthPillar, TrendAlert[]>);
+  
+  const pillarLabels: Record<HealthPillar, string> = {
+    nutrition: 'Nutrition',
+    exercise: 'Exercise',
+    sleep: 'Sleep',
+    stress: 'Stress Management',
+    spiritual: 'Spiritual Health',
+  };
+  
+  const pillarColors: Record<HealthPillar, { bg: string; border: string; text: string }> = {
+    nutrition: { bg: 'bg-emerald-50', border: 'border-emerald-200', text: 'text-emerald-800' },
+    exercise: { bg: 'bg-blue-50', border: 'border-blue-200', text: 'text-blue-800' },
+    sleep: { bg: 'bg-indigo-50', border: 'border-indigo-200', text: 'text-indigo-800' },
+    stress: { bg: 'bg-amber-50', border: 'border-amber-200', text: 'text-amber-800' },
+    spiritual: { bg: 'bg-purple-50', border: 'border-purple-200', text: 'text-purple-800' },
+  };
+
+  return (
+    <section className="rounded-3xl bg-white p-6 shadow-sm ring-1 ring-slate-200">
+      <div className="flex items-center justify-between mb-4">
+      <div>
+          <h3 className="text-lg font-semibold text-slate-900">Proactive Health Alerts</h3>
+          <p className="text-sm text-slate-500">Early warning system based on five pillars of health</p>
+      </div>
+          <div className="flex items-center gap-2">
+          {warningAlerts.length > 0 && (
+            <span className="inline-flex items-center rounded-full bg-red-100 px-3 py-1 text-xs font-semibold text-red-800">
+              {warningAlerts.length} Warning{warningAlerts.length !== 1 ? 's' : ''}
+            </span>
+          )}
+          {cautionAlerts.length > 0 && (
+            <span className="inline-flex items-center rounded-full bg-amber-100 px-3 py-1 text-xs font-semibold text-amber-800">
+              {cautionAlerts.length} Caution{cautionAlerts.length !== 1 ? 's' : ''}
+              </span>
+          )}
+        </div>
+      </div>
+
+      {/* Group alerts by pillar */}
+      <div className="space-y-4">
+        {(Object.keys(alertsByPillar) as HealthPillar[]).map(pillar => {
+          const pillarAlerts = alertsByPillar[pillar];
+          if (pillarAlerts.length === 0) return null;
+          
+          const colors = pillarColors[pillar];
+          
+            return (
+            <div key={pillar} className={`rounded-xl border-2 ${colors.border} ${colors.bg} p-4`}>
+              <div className="flex items-center justify-between mb-3">
+                <h4 className={`font-semibold ${colors.text}`}>
+                  {pillarLabels[pillar]} ({pillarAlerts.length})
+                </h4>
+        </div>
+              <div className="space-y-2">
+                {pillarAlerts.map(alert => (
+                  <AlertCard key={alert.id} alert={alert} />
+                ))}
+      </div>
+    </div>
+          );
+        })}
+  </div>
+    </section>
+  );
+};
+
+const AlertCard = ({ alert }: { alert: TrendAlert }) => {
+  const severityColors = alert.severity === 'warning'
+    ? { bg: 'bg-red-50', border: 'border-red-200', text: 'text-red-800', badge: 'bg-red-100 text-red-800' }
+    : { bg: 'bg-amber-50', border: 'border-amber-200', text: 'text-amber-800', badge: 'bg-amber-100 text-amber-800' };
+  
+  const directionIcon = alert.alertType.includes('lower') ? '↓' : '↑';
+  const directionColor = alert.alertType.includes('lower') ? 'text-blue-600' : 'text-orange-600';
+
+  return (
+    <div className={`rounded-lg border ${severityColors.border} ${severityColors.bg} p-3`}>
+      <div className="flex items-start justify-between">
+        <div className="flex-1">
+          <div className="flex items-center gap-2 mb-1">
+            <p className={`font-semibold ${severityColors.text}`}>{alert.metricLabel}</p>
+            <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold ${severityColors.badge}`}>
+              {alert.severity === 'warning' ? '⚠️ Warning' : '⚠️ Caution'}
+            </span>
+          </div>
+          <p className={`text-sm ${severityColors.text} mb-2`}>{alert.message}</p>
+          {alert.daysToEdge && (
+            <p className="text-xs text-slate-600">
+              Estimated <span className="font-semibold">{alert.daysToEdge} days</span> until out of range if trend continues
+            </p>
+          )}
+        </div>
+        <div className="ml-4 flex flex-col items-end">
+          <span className={`inline-flex items-center rounded-lg px-2 py-1 text-sm font-semibold ${directionColor} bg-white border border-slate-200`}>
+            <span className="mr-1">{directionIcon}</span>
+            {alert.currentValue.toFixed(1)} {alert.unit}
+              </span>
+          <p className="text-xs text-slate-500 mt-1">
+            Range: {alert.referenceRange.min.toFixed(1)} - {alert.referenceRange.max.toFixed(1)}
+          </p>
+          </div>
+        </div>
+      </div>
+      );
 };
 
 const StatCard = ({
@@ -1061,7 +1401,7 @@ const StatCard = ({
       ? "border-red-200 bg-red-50 text-red-700"
       : "border-slate-200 bg-white text-slate-900";
 
-  return (
+      return (
     <article className={`rounded-3xl border px-5 py-4 shadow-sm ${toneClasses}`}>
       <p className="text-xs font-semibold uppercase tracking-[0.3em] text-slate-400">{title}</p>
       <p className="mt-3 text-2xl font-semibold">{value}</p>
@@ -1082,17 +1422,17 @@ const MedicationCard = ({
         <h4 className="text-base font-semibold text-slate-900">{medication.name}</h4>
         <p className="mt-1 text-sm font-medium text-slate-700">{medication.dosage}</p>
         <p className="mt-2 text-xs text-slate-600">{medication.description}</p>
-      </div>
+        </div>
       <div className="flex-shrink-0">
         <span className="inline-flex items-center rounded-full bg-blue-100 px-3 py-1 text-xs font-semibold text-blue-700">
           Active
-        </span>
-      </div>
-    </div>
+            </span>
+          </div>
+        </div>
     <div className="mt-3 flex items-center gap-2 text-xs text-slate-500">
       <span className="uppercase tracking-[0.3em]">Started</span>
       <span>{medication.date}</span>
-  </div>
+                </div>
   </article>
 );
 
@@ -1105,34 +1445,34 @@ const GeneticMarkerCard = ({ marker }: { marker: GeneticMarker }) => {
         return "Methylenetetrahydrofolate reductase gene involved in folate (vitamin B9) metabolism. Variants can affect how the body processes folic acid and related compounds.";
       case "CYP2D6":
         return "Cytochrome P450 2D6 enzyme gene involved in drug metabolism. Variants affect how the body processes many medications, influencing drug efficacy and dosing requirements.";
-      default:
+    default:
         return "Genetic variant with potential clinical significance.";
-    }
-  };
+  }
+};
 
   return (
     <article className="rounded-2xl border border-slate-200 bg-slate-50 p-5">
-        <div>
+      <div>
         <p className="text-xs font-semibold uppercase tracking-[0.3em] text-slate-400">{marker.gene}</p>
         <p className="mt-1 text-lg font-semibold text-slate-900">{marker.variant}</p>
         <p className="mt-1 text-sm text-slate-500">{marker.status}</p>
-          </div>
+      </div>
       <div className="mt-4">
         <p className="text-sm leading-relaxed text-slate-700">{getExplanation(marker.gene)}</p>
-      </div>
+    </div>
       {marker.relatedLabs?.length || marker.relatedMedications?.length ? (
         <div className="mt-4 space-y-2 border-t border-slate-200 pt-4">
           {marker.relatedLabs?.length ? (
             <p className="text-xs uppercase tracking-[0.3em] text-slate-400">
               Related Labs: <span className="ml-2 normal-case text-slate-500">{marker.relatedLabs.join(", ")}</span>
             </p>
-          ) : null}
+      ) : null}
           {marker.relatedMedications?.length ? (
             <p className="text-xs uppercase tracking-[0.3em] text-slate-400">
               Medications: <span className="ml-2 normal-case text-slate-500">{marker.relatedMedications.join(", ")}</span>
             </p>
-          ) : null}
-        </div>
+      ) : null}
+    </div>
       ) : null}
   </article>
 );

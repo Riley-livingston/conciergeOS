@@ -37,8 +37,23 @@ function generateLabs(): LabResult[] {
     { name: 'AST', unit: 'U/L', refMin: 10, refMax: 40, optMin: 15, optMax: 25, source: 'LabCorp' as const },
   ];
 
-  // Generate labs over the past 6 months
-  const dates = [180, 150, 120, 90, 60, 30, 14, 7, 0]; // days ago
+  // Generate labs over the past 1 year (more frequent in recent months)
+  // Quarterly labs for first 9 months, then monthly/bi-weekly in last 3 months
+  const dates: number[] = [];
+  
+  // Quarterly labs for first 9 months (270 days)
+  for (let i = 360; i >= 90; i -= 90) {
+    dates.push(i);
+  }
+  
+  // Monthly labs for months 3-1 (90, 60, 30 days ago)
+  dates.push(90, 60, 30);
+  
+  // Bi-weekly labs for last month (14, 7, 0 days ago)
+  dates.push(14, 7, 0);
+  
+  // Sort to ensure chronological order
+  dates.sort((a, b) => b - a);
   
   dates.forEach((days, dateIdx) => {
     const timestamp = daysAgo(days);
@@ -50,10 +65,24 @@ function generateLabs(): LabResult[] {
       const variation = (test.refMax - test.refMin) * 0.3;
       let value = baseValue + (Math.random() - 0.5) * variation;
       
+      // Create declining trend for Vitamin D (25-OH) to trigger proactive alert
+      // Start at 55 ng/mL 360 days ago, decline to ~32 ng/mL (approaching lower limit of 30)
+      if (test.name === 'Vitamin D (25-OH)') {
+        const daysFromStart = 360 - days;
+        const declineRate = 23 / 360; // Decline from 55 to 32 over 360 days
+        const baseValue = 55 - (daysFromStart * declineRate);
+        // Add small noise but ensure clear declining trend
+        value = baseValue + (Math.random() - 0.5) * 2; // Reduced noise
+        value = Math.max(30, Math.min(60, value)); // Keep within reasonable bounds
+        // Ensure recent values are definitely approaching the lower limit
+        if (days <= 30) {
+          value = Math.min(value, 35); // Recent values should be 30-35
+        }
+      }
+      
       // Force some out-of-range values
       if (dateIdx === 2 && idx === 1) value = test.refMax * 1.15; // High LDL
       if (dateIdx === 4 && idx === 4) value = test.refMax * 1.1; // High HbA1c
-      if (dateIdx === 6 && idx === 9) value = test.refMin * 0.7; // Low Vitamin D
       
       const isOutOfRange = value < test.refMin || value > test.refMax;
       const isOutOfOptimal = test.optMin && test.optMax 
@@ -138,15 +167,32 @@ function generateWearables(): WearableData[] {
   const wearables: WearableData[] = [];
   const now = new Date();
 
-  // Generate daily data for the past 30 days
-  for (let i = 30; i >= 0; i--) {
+  // Generate daily data for the past 1 year (365 days)
+  for (let i = 365; i >= 0; i--) {
     const date = daysAgo(i);
     
-    // Oura Ring data - with some out-of-range values
-    // Sleep: Normal 7-9 hours, generate some nights with insufficient sleep
-    let sleepValue = 7.5 + (Math.random() - 0.5) * 2.5; // Base: 6-9 hours
-    if (i % 7 === 0) sleepValue = 5.5 + Math.random() * 0.8; // Weekly poor sleep night (5.5-6.3 hours)
-    if (i % 10 === 0) sleepValue = 9.5 + Math.random() * 1.0; // Occasional oversleep (9.5-10.5 hours)
+    // Oura Ring data - with declining trends to trigger proactive alerts
+    // Sleep: Create declining trend from 8.5 hours to 7.1 hours (approaching lower limit of 7)
+    // This will trigger a proactive alert as it approaches the lower reference range
+    const daysFromStart = 365 - i;
+    const sleepDeclineRate = 1.4 / 365; // Decline from 8.5 to 7.1 over 365 days
+    let sleepValue = 8.5 - (daysFromStart * sleepDeclineRate) + (Math.random() - 0.5) * 0.3; // Reduced noise
+    
+    // Add weekly variation (weekends slightly better)
+    if (i % 7 === 0 || i % 7 === 6) {
+      sleepValue += 0.15; // Slightly better on weekends
+    }
+    
+    // Add occasional poor sleep nights
+    if (i % 10 === 0) sleepValue -= 0.4 + Math.random() * 0.3;
+    
+    // Ensure recent values are definitely approaching the lower limit
+    if (i <= 30) {
+      sleepValue = Math.min(sleepValue, 7.3); // Recent values should be 7.0-7.3 hours
+    }
+    
+    // Ensure it doesn't go below 6.5 or above 9.5
+    sleepValue = Math.max(6.5, Math.min(9.5, sleepValue));
     
     wearables.push({
       id: `oura-sleep-${date.getTime()}`,
@@ -158,9 +204,23 @@ function generateWearables(): WearableData[] {
       metadata: { deepSleep: 1.8, remSleep: 1.5, lightSleep: 4.0 },
     });
 
-    // HRV: Normal 20-60 ms, generate some low values
-    let hrvValue = 35 + (Math.random() - 0.5) * 20; // Base: 25-45 ms
-    if (i % 5 === 0) hrvValue = 15 + Math.random() * 5; // Occasional low HRV (15-20 ms)
+    // HRV: Create declining trend from 45 ms to 22 ms (approaching lower limit of 20)
+    // This will trigger a proactive alert as it approaches the lower reference range
+    const hrvDeclineRate = 23 / 365; // Decline from 45 to 22 over 365 days
+    let hrvValue = 45 - (daysFromStart * hrvDeclineRate) + (Math.random() - 0.5) * 2; // Reduced noise
+    
+    // Add weekly variation (recovery days)
+    if (i % 7 === 0) {
+      hrvValue += 1.5; // Slightly better on rest days
+    }
+    
+    // Ensure recent values are definitely approaching the lower limit
+    if (i <= 30) {
+      hrvValue = Math.min(hrvValue, 25); // Recent values should be 20-25 ms
+    }
+    
+    // Ensure it doesn't go below 18 or above 60
+    hrvValue = Math.max(18, Math.min(60, hrvValue));
     
     wearables.push({
       id: `oura-hrv-${date.getTime()}`,
@@ -171,8 +231,8 @@ function generateWearables(): WearableData[] {
       unit: 'ms',
     });
 
-    // Heart Rate: Normal 60-100 bpm, generate some elevated values
-    let heartRateValue = 70 + (Math.random() - 0.5) * 20; // Base: 60-80 bpm
+    // Heart Rate: Normal 60-100 bpm, relatively stable with some variation
+    let heartRateValue = 70 + (Math.random() - 0.5) * 15; // Base: 62.5-77.5 bpm
     if (i % 6 === 0) heartRateValue = 105 + Math.random() * 10; // Occasional elevated (105-115 bpm)
     if (i % 8 === 0) heartRateValue = 55 + Math.random() * 3; // Occasional low (55-58 bpm)
     
@@ -213,10 +273,16 @@ function generateWearables(): WearableData[] {
     });
 
     // Daily weight measurement - Normal range varies, using 150-200 lbs as reference
-    // Generate some weight values outside the range
-    let weightValue = 175 - (30 - i) * 0.1 + (Math.random() - 0.5) * 0.5; // Base trend
-    if (i % 7 === 0) weightValue = 145 + Math.random() * 3; // Occasional low weight (145-148 lbs)
-    if (i % 9 === 0) weightValue = 202 + Math.random() * 5; // Occasional high weight (202-207 lbs)
+    // Slight upward trend over the year (realistic weight gain)
+    const weightBase = 175;
+    const weightTrend = (daysFromStart / 365) * 3; // Gain ~3 lbs over the year
+    let weightValue = weightBase + weightTrend + (Math.random() - 0.5) * 1.5; // Daily variation
+    
+    // Weekly patterns (slightly lower on Mondays after weekend)
+    if (i % 7 === 0) weightValue -= 0.5;
+    
+    // Ensure it stays within reasonable bounds
+    weightValue = Math.max(170, Math.min(185, weightValue));
     
     wearables.push({
       id: `weight-${date.getTime()}`,
@@ -228,7 +294,10 @@ function generateWearables(): WearableData[] {
     });
 
     // Manual vitals (every few days) - Normal BP: <120/<80 mmHg
-    if (i % 3 === 0) {
+    // More frequent in recent months
+    const shouldMeasureBP = i <= 90 ? (i % 3 === 0) : (i % 7 === 0); // Every 3 days in last 3 months, weekly before
+    
+    if (shouldMeasureBP) {
       let systolic = 115 + (Math.random() - 0.3) * 10; // Base: 112-125
       let diastolic = 75 + (Math.random() - 0.3) * 8; // Base: 73-80
       
@@ -258,7 +327,7 @@ function generateEHREvents(): EHREvent[] {
   return [
     {
       id: 'ehr-1',
-      timestamp: daysAgo(180),
+      timestamp: daysAgo(360),
       type: 'medication',
       title: 'Started Metformin 500mg',
       description: 'Prescribed for insulin resistance management',
@@ -266,38 +335,62 @@ function generateEHREvents(): EHREvent[] {
     },
     {
       id: 'ehr-2',
-      timestamp: daysAgo(150),
+      timestamp: daysAgo(330),
+      type: 'note',
+      title: 'Initial Consultation',
+      description: 'Comprehensive health assessment. Discussed lifestyle modifications.',
+      provider: 'Dr. Smith',
+    },
+    {
+      id: 'ehr-3',
+      timestamp: daysAgo(270),
       type: 'note',
       title: 'Follow-up Consultation',
       description: 'Patient reports improved energy levels. Discussed dietary modifications.',
       provider: 'Dr. Smith',
     },
     {
-      id: 'ehr-3',
-      timestamp: daysAgo(120),
+      id: 'ehr-4',
+      timestamp: daysAgo(240),
       type: 'medication',
       title: 'Increased Metformin to 1000mg',
       description: 'Titrated based on glucose response',
       provider: 'Dr. Smith',
     },
     {
-      id: 'ehr-4',
-      timestamp: daysAgo(90),
+      id: 'ehr-5',
+      timestamp: daysAgo(180),
       type: 'procedure',
       title: 'DEXA Scan',
       description: 'Bone density assessment - T-score: -1.2',
       provider: 'Dr. Smith',
     },
     {
-      id: 'ehr-5',
-      timestamp: daysAgo(60),
+      id: 'ehr-6',
+      timestamp: daysAgo(120),
       type: 'medication',
       title: 'Added Vitamin D3 5000 IU',
-      description: 'Prescribed for low Vitamin D levels',
+      description: 'Supplementation for declining Vitamin D levels',
       provider: 'Dr. Smith',
     },
     {
-      id: 'ehr-6',
+      id: 'ehr-7',
+      timestamp: daysAgo(90),
+      type: 'note',
+      title: 'Quarterly Review',
+      description: 'Comprehensive metabolic panel reviewed. Noted declining sleep and HRV trends.',
+      provider: 'Dr. Smith',
+    },
+    {
+      id: 'ehr-8',
+      timestamp: daysAgo(60),
+      type: 'note',
+      title: 'Follow-up Consultation',
+      description: 'Discussed sleep hygiene and stress management strategies.',
+      provider: 'Dr. Smith',
+    },
+    {
+      id: 'ehr-9',
       timestamp: daysAgo(30),
       type: 'note',
       title: 'Quarterly Review',
@@ -305,7 +398,7 @@ function generateEHREvents(): EHREvent[] {
       provider: 'Dr. Smith',
     },
     {
-      id: 'ehr-7',
+      id: 'ehr-10',
       timestamp: daysAgo(7),
       type: 'appointment',
       title: 'Upcoming: Annual Physical',
