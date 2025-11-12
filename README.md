@@ -24,6 +24,7 @@ Precision Clinical OS is the first platform engineered to solve the physician's 
 
 4. **Role-Based Access**
    - Physician view: Full access to all data
+   - Coach view: Limited data review (no EHR/genetic access)
 
 ## Getting Started
 
@@ -68,6 +69,10 @@ src/
 - **Language**: TypeScript
 - **Styling**: Tailwind CSS
 - **Data**: Synthetic patient data generator
+
+## Success Metric (MVP Pilot)
+
+Concierge physicians in the pilot must confirm that the time required for pre-visit data synthesis is reduced by at least 50%.
 
 ## Learn More
 
